@@ -1,247 +1,186 @@
 """
-model/transformer.py — HappyBot Top-Level Module
+transformer.py — HappyBot top-level module.
 
-This wraps Encoder + Decoder into a single nn.Module and:
-  1. Owns and initialises the shared embedding (single source of truth).
-  2. Handles all mask construction logic in one place.
-  3. Implements the unified forward pass for training.
-  4. Exposes encode() and decode_step() separately for inference.
-
-Design decision: Encoder and Decoder share the same token embedding.
-WHY: On a 10K vocabulary with d_model=256 the embedding matrix is
-     10000×256 = 2.56M parameters. Sharing it across encoder input,
-     decoder input, AND decoder output (weight tying) eliminates 5.12M
-     redundant parameters — critical for generalisation on ~50K pairs.
-
-FIX NOTES (NaN/Inf training crash):
-  - shared_embedding now initialised with std=0.02 (GPT-style) and NO
-    sqrt(d_model) forward scaling. The original code used std=d_model^-0.5
-    (≈0.0625) and then scaled up 16× at runtime — net effect was std≈1.0
-    which sounds fine, BUT the tied weight receives gradient from THREE
-    paths simultaneously (enc_embed, dec_embed, dec_output_proj), so the
-    effective gradient variance is 3× higher, pushing norms out of range
-    during the very first backward pass.
-  - Encoder is now constructed with shared_embedding= passed directly to
-    its __init__ so it uses the same nn.Embedding object (not a post-hoc
-    attribute override which could break if Encoder.__init__ ran its own
-    nn.init calls on self.embedding after assignment).
-  - nan_to_num guard on gen_logits REMOVED — it was hiding the upstream bug.
-  - Added a forward-pass NaN diagnostic (debug_nans=True) that can be
-    toggled at training time for fast fault isolation.
+Responsibilities:
+  - Owns the single shared embedding (encoder input = decoder input = decoder output projection)
+  - Builds Encoder and Decoder, passes the shared embedding into both
+  - Enforces weight tying: output_proj.weight = embedding.weight
+  - Provides mask-building helpers (padding mask, causal mask is internal to Decoder)
+  - Exposes forward() for training and encode()/decode() for inference
 """
 
 import torch
 import torch.nn as nn
-from typing import Dict, Optional, Tuple, List
-
 from model.encoder import Encoder
 from model.decoder import Decoder
 
 
 class HappyBot(nn.Module):
     """
-    Full Happy-Bot Encoder-Decoder Transformer.
+    HappyBot: Encoder-Decoder Transformer for psychologically grounded dialogue.
 
-    A single shared nn.Embedding is created here and passed into both
-    Encoder and Decoder. The decoder's output projection is then tied to
-    that same tensor (weight tying).
+    Architecture overview:
+      - Shared BPE embedding (vocab_size × d_model) used by encoder input,
+        decoder input, AND decoder output projection (weight tying).
+      - Encoder: 4 layers, 2-head self-attention, d_model=256, d_ff=1024
+        + EmotionHead + StrategyHead on [CLS] token
+      - Decoder: 4 layers, masked self-attn + cross-attention bridge + output projection
+
+    Training forward pass:
+      Input: (src, tgt_input, src_mask, emotion_labels, strategy_labels)
+      Output: (gen_logits, emotion_logits, strategy_logits)
+      Loss: L_gen + 0.3 * L_emotion + 0.3 * L_strategy
+
+    Inference:
+      1. encode(src) → cache memory + predict emotion/strategy
+      2. decode(tgt_so_far, memory, src_mask) → next token logits
     """
 
     def __init__(
         self,
-        vocab_size: int,
+        vocab_size: int = 10_000,
         d_model: int = 256,
-        num_heads: int = 2,
         num_encoder_layers: int = 4,
         num_decoder_layers: int = 4,
+        num_heads: int = 2,
         d_ff: int = 1024,
-        max_seq_len: int = 512,
+        max_len: int = 512,
         dropout: float = 0.1,
         num_emotion_classes: int = 32,
         num_strategy_classes: int = 8,
         pad_token_id: int = 0,
     ):
         super().__init__()
-
         self.pad_token_id = pad_token_id
-        self.d_model      = d_model
-        self.vocab_size   = vocab_size
+        self.d_model = d_model
+        self.vocab_size = vocab_size
 
-        # ── Shared embedding ───────────────────────────────────────────────
-        # std=0.02: the de-facto standard for Transformer token embeddings
-        # (GPT, BERT, etc.). With this init the embedding outputs are in
-        # [-0.06, 0.06] before LayerNorm, which keeps attention scores sane
-        # (max QK^T / sqrt(d_k) ≈ 0.06² × 128 / 11.3 ≈ 0.04) at step 0.
-        self.shared_embedding = nn.Embedding(
-            vocab_size, d_model, padding_idx=pad_token_id
-        )
-        nn.init.normal_(self.shared_embedding.weight, mean=0.0, std=0.02)
+        # ── Shared embedding ──────────────────────────────────────────────
+        # This single embedding matrix is used in THREE places:
+        #   1. Encoder input embedding
+        #   2. Decoder input embedding
+        #   3. Decoder output projection (weight tied, transposed)
+        self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=pad_token_id)
+        nn.init.normal_(self.embedding.weight, mean=0.0, std=d_model ** -0.5)
+        # Zero out the padding embedding row
         with torch.no_grad():
-            self.shared_embedding.weight[pad_token_id].fill_(0)
+            self.embedding.weight[pad_token_id].fill_(0.0)
 
-        # ── Encoder ────────────────────────────────────────────────────────
-        # Pass shared_embedding to Encoder.__init__ so it assigns
-        # self.embedding = shared_embedding BEFORE any further init runs.
+        # ── Encoder ───────────────────────────────────────────────────────
         self.encoder = Encoder(
-            vocab_size=vocab_size,
+            embedding=self.embedding,
             d_model=d_model,
-            num_heads=num_heads,
             num_layers=num_encoder_layers,
+            num_heads=num_heads,
             d_ff=d_ff,
-            max_seq_len=max_seq_len,
+            max_len=max_len,
             dropout=dropout,
             num_emotion_classes=num_emotion_classes,
             num_strategy_classes=num_strategy_classes,
-            shared_embedding=self.shared_embedding,
         )
 
-        # ── Decoder ────────────────────────────────────────────────────────
+        # ── Decoder ───────────────────────────────────────────────────────
         self.decoder = Decoder(
-            vocab_size=vocab_size,
+            embedding=self.embedding,
             d_model=d_model,
-            num_heads=num_heads,
             num_layers=num_decoder_layers,
+            num_heads=num_heads,
             d_ff=d_ff,
-            max_seq_len=max_seq_len,
+            max_len=max_len,
             dropout=dropout,
-            shared_embedding=self.shared_embedding,
+            vocab_size=vocab_size,
         )
 
-        # ── Parameter count ────────────────────────────────────────────────
-        total     = sum(p.numel() for p in self.parameters())
-        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        print(f"HappyBot initialized: {total:,} total params | {trainable:,} trainable")
+        # ── Weight Tying ─────────────────────────────────────────────────
+        # Tie decoder output_proj.weight to the shared embedding matrix.
+        # This is the primary way to reduce overfitting on a small dataset.
+        # The output projection computes: logits = hidden @ embedding.weight.T
+        self.decoder.output_proj.weight = self.embedding.weight
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Mask helpers
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Mask Builders ─────────────────────────────────────────────────────
 
-    def _make_padding_mask(self, ids: torch.Tensor) -> torch.Tensor:
-        """(B, T) bool mask — True where token == pad_token_id."""
-        return ids == self.pad_token_id
+    def make_src_mask(self, src: torch.Tensor) -> torch.Tensor:
+        """
+        Padding mask for encoder input.
+        Returns: (B, 1, 1, T_src) — True where token is real (not PAD).
+        The mask is broadcast to (B, H, T_q, T_k) inside attention.
+        """
+        return (src != self.pad_token_id).unsqueeze(1).unsqueeze(2)  # (B, 1, 1, T)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Training forward pass
-    # ─────────────────────────────────────────────────────────────────────────
+    def make_tgt_pad_mask(self, tgt: torch.Tensor) -> torch.Tensor:
+        """
+        Padding mask for decoder input (combined with causal mask inside Decoder).
+        Returns: (B, 1, 1, T_tgt)
+        """
+        return (tgt != self.pad_token_id).unsqueeze(1).unsqueeze(2)
+
+    # ── Forward (Training) ────────────────────────────────────────────────
 
     def forward(
         self,
-        encoder_ids: torch.Tensor,
-        decoder_input: torch.Tensor,
-        encoder_mask: Optional[torch.Tensor] = None,
-        decoder_mask: Optional[torch.Tensor] = None,
-        debug_nans: bool = False,
-    ) -> Dict[str, object]:
+        src: torch.Tensor,            # (B, T_src)
+        tgt: torch.Tensor,            # (B, T_tgt) — decoder INPUT (teacher-forced)
+        src_mask: torch.Tensor = None,
+        tgt_pad_mask: torch.Tensor = None,
+    ) -> dict:
         """
-        Full forward pass for training.
+        Full training forward pass.
 
-        Args:
-            encoder_ids:    (B, S)  encoder input token IDs.
-            decoder_input:  (B, T)  teacher-forced decoder input.
-            encoder_mask:   (B, S)  pre-computed padding mask (True=pad); optional.
-            decoder_mask:   (B, T)  pre-computed padding mask (True=pad); optional.
-            debug_nans:     If True, print tensor stats at each sub-step.
-
-        Returns dict:
-            gen_logits:       (B, T, vocab_size)
-            emotion_logits:   (B, num_emotion_classes)
-            strategy_logits:  (B, num_strategy_classes)
-            encoder_attn:     list of attention weight tensors
-            cross_attn:       list of cross-attention weight tensors
+        Returns dict with:
+          "logits": (B, T_tgt, vocab_size) — generation logits
+          "emotion_logits": (B, num_emotion_classes)
+          "strategy_logits": (B, num_strategy_classes)
+          "cross_attn_weights": list of (B, H, T_tgt, T_src) — for visualization
         """
-        enc_pad_mask = encoder_mask if encoder_mask is not None \
-                       else self._make_padding_mask(encoder_ids)
-        dec_pad_mask = decoder_mask if decoder_mask is not None \
-                       else self._make_padding_mask(decoder_input)
+        if src_mask is None:
+            src_mask = self.make_src_mask(src)
+        if tgt_pad_mask is None:
+            tgt_pad_mask = self.make_tgt_pad_mask(tgt)
 
-        # ── Encoder ───────────────────────────────────────────────────────
-        H_enc, emotion_logits, strategy_logits, enc_attn = self.encoder(
-            src_ids=encoder_ids,
-            src_key_padding_mask=enc_pad_mask,
-        )
+        # Encode
+        enc_out = self.encoder(src, src_mask)
+        memory = enc_out["memory"]
 
-        if debug_nans:
-            _check("H_enc", H_enc)
-            _check("emotion_logits", emotion_logits)
-
-        # ── Decoder (teacher forcing) ──────────────────────────────────────
-        gen_logits, dec_self_attn, cross_attn = self.decoder(
-            tgt_ids=decoder_input,
-            memory=H_enc,
-            tgt_key_padding_mask=dec_pad_mask,
-            memory_key_padding_mask=enc_pad_mask,
-        )
-
-        if debug_nans:
-            _check("gen_logits", gen_logits)
+        # Decode
+        dec_out = self.decoder(tgt, memory, src_mask, tgt_pad_mask)
 
         return {
-            "gen_logits":      gen_logits,
-            "emotion_logits":  emotion_logits,
-            "strategy_logits": strategy_logits,
-            "encoder_attn":    enc_attn,
-            "cross_attn":      cross_attn,
+            "logits": dec_out["logits"],
+            "emotion_logits": enc_out["emotion_logits"],
+            "strategy_logits": enc_out["strategy_logits"],
+            "cross_attn_weights": dec_out["cross_attn_weights"],
+            "encoder_attn_weights": enc_out["attn_weights"],
         }
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Inference: encode once
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Inference Helpers ─────────────────────────────────────────────────
 
     @torch.no_grad()
-    def encode(
-        self,
-        encoder_ids: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def encode(self, src: torch.Tensor, src_mask: torch.Tensor = None) -> dict:
         """
-        Run encoder and return cached outputs for autoregressive decoding.
-
-        Returns:
-            H_enc, emotion_logits, strategy_logits, enc_pad_mask
+        Run encoder once and cache output for autoregressive decoding.
+        Returns encoder output dict (memory, emotion_logits, strategy_logits, ...)
         """
-        enc_pad_mask = self._make_padding_mask(encoder_ids)
-        H_enc, emotion_logits, strategy_logits, _ = self.encoder(
-            encoder_ids, src_key_padding_mask=enc_pad_mask
-        )
-        return H_enc, emotion_logits, strategy_logits, enc_pad_mask
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Inference: single decode step
-    # ─────────────────────────────────────────────────────────────────────────
+        if src_mask is None:
+            src_mask = self.make_src_mask(src)
+        enc_out = self.encoder(src, src_mask)
+        enc_out["src_mask"] = src_mask
+        return enc_out
 
     @torch.no_grad()
     def decode_step(
         self,
-        decoder_ids: torch.Tensor,
-        H_enc: torch.Tensor,
-        enc_pad_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        tgt_so_far: torch.Tensor,   # (B, T_generated_so_far)
+        memory: torch.Tensor,        # (B, T_src, d_model) — cached encoder output
+        src_mask: torch.Tensor,      # (B, 1, 1, T_src)
+    ) -> torch.Tensor:
         """
-        One forward pass of the decoder for autoregressive generation.
-
-        Returns:
-            logits_last: (B, vocab_size) — logits for the NEXT token
-            cross_attn:  list of cross-attention weights
+        Run one full decoder forward with the tokens generated so far.
+        Returns logits for the LAST position only: (B, vocab_size).
         """
-        dec_pad_mask = self._make_padding_mask(decoder_ids)
+        dec_out = self.decoder(tgt_so_far, memory, src_mask, tgt_pad_mask=None)
+        # Take only the last position's logits for next-token prediction
+        return dec_out["logits"][:, -1, :]  # (B, vocab_size)
 
-        logits, _, cross_attn = self.decoder(
-            tgt_ids=decoder_ids,
-            memory=H_enc,
-            tgt_key_padding_mask=dec_pad_mask,
-            memory_key_padding_mask=enc_pad_mask,
-        )
-
-        return logits[:, -1, :], cross_attn
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Debug helper
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _check(name: str, t: torch.Tensor) -> None:
-    """Print tensor statistics. Call with debug_nans=True during debugging."""
-    has_nan = torch.isnan(t).any().item()
-    has_inf = torch.isinf(t).any().item()
-    print(f"  [{name}] shape={tuple(t.shape)} "
-          f"min={t.min():.4f} max={t.max():.4f} "
-          f"nan={has_nan} inf={has_inf}")
+    def count_parameters(self) -> int:
+        """Count trainable parameters."""
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)

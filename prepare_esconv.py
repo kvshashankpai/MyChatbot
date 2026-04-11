@@ -1,212 +1,183 @@
 """
-prepare_esconv.py — Normalise ESConv.json and produce Phase 2 training JSONL
+prepare_esconv.py — Normalise raw ESConv.json → train/val/test JSONL splits.
+
+What this script fixes in the raw ESConv.json:
+  - Role names: "speaker" → "seeker", "listener" → "supporter"
+  - Strategy field: moved from turn["annotation"]["strategy"] → turn["strategy"]
+  - 12+ raw strategy variants mapped to 8 canonical labels
+  - Missing emotion_intensity field defaulted to 3
+  - Emotions not in ESCONV_EMOTION_TO_ID mapped to "neutral" (id=7)
+
+Produces:
+  data/processed/esconv_train.jsonl
+  data/processed/esconv_val.jsonl
+  data/processed/esconv_test.jsonl
+  data/processed/strategy_counts.json   ← for class-weighted loss in Phase 2
 
 Usage:
-    python prepare_esconv.py \
-        --input   data/raw/ESConv.json \
-        --out_dir data/processed
-
-Output files:
-    data/processed/esconv_train.jsonl
-    data/processed/esconv_val.jsonl
-    data/processed/esconv_test.jsonl
-    data/processed/strategy_counts.json
-
-What this script does
-─────────────────────
-The raw ESConv.json schema does not exactly match what dataset.extract_esconv_qa_pairs()
-expects. This script normalises the raw data first, then delegates all QA-pair
-extraction, token-budget management, and label encoding to the existing
-dataset.py function so there is a single source of truth.
-
-Normalisation applied to each conversation
-───────────────────────────────────────────
-1. Role names:   "speaker"  → "seeker"
-                 "listener" → "supporter"
-2. Strategy:     moved from turn["annotation"]["strategy"] → turn["strategy"]
-                 Raw variants mapped to ESCONV_STRATEGY_MAP keys:
-                   "Other" / "Others"             → "Others"
-                   "Questions" / "Question"        → "Questions"
-                   "Approval and Reassurance"      → "Affirmation and Reassurance"
-                   "Restatement"                   → "Restatement or Paraphrasing"
-                   "Reflection of feelings"        → "Reflection of Feelings"
-                   "Direct Guidance"               → "Providing Suggestions"
-3. Intensity:    field absent in this release → default 3
-4. Turns with no strategy annotation get "Others"
-
-Emotion coverage
-────────────────
-ESCONV_EMOTION_TO_ID covers: anxiety, sadness, anger, fear, disgust, joy, surprise, neutral
-ESConv emotions not in that map: depression, shame, nervousness
-These are mapped to neutral (id=7) by ESCONV_EMOTION_TO_ID.get(x, 7) inside dataset.py.
-
-Split
-─────
-Conversations are split 70/15/15 (train/val/test) at conversation level.
-No conversation leaks across splits.
+  python prepare_esconv.py
+  python prepare_esconv.py --input data/raw/ESConv.json --out_dir data/processed
 """
 
 import argparse
 import json
 import os
 import random
-import sys
-import tempfile
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent))
-
-from dataset import extract_esconv_qa_pairs
+from collections import Counter
+from dataset import extract_esconv_qa_pairs, CANONICAL_STRATEGIES, STRATEGY_TO_ID
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Raw strategy → ESCONV_STRATEGY_MAP key normalisation
-# ─────────────────────────────────────────────────────────────────────────────
-
-RAW_STRATEGY_NORM = {
-    "other":                        "Others",
-    "others":                       "Others",
-    "questions":                    "Questions",
-    "question":                     "Questions",
-    "restatement or paraphrasing":  "Restatement or Paraphrasing",
-    "restatement":                  "Restatement or Paraphrasing",
-    "reflection of feelings":       "Reflection of Feelings",
-    "affirmation and reassurance":  "Affirmation and Reassurance",
-    "approval and reassurance":     "Affirmation and Reassurance",
-    "providing suggestions":        "Providing Suggestions",
-    "direct guidance":              "Providing Suggestions",
-    "information":                  "Information",
-    "self-disclosure":              "Self-disclosure",
-}
-
-
-def normalise_strategy(raw: str) -> str:
-    return RAW_STRATEGY_NORM.get(raw.strip().lower(), "Others")
-
-
-def normalise_conversation(conv: dict) -> dict:
+def normalise_dialogue(dlg: dict) -> dict:
     """
-    Convert one raw ESConv conversation dict into the schema that
-    extract_esconv_qa_pairs() expects.
+    Normalise a single raw ESConv dialogue to the expected format.
+    Returns a normalised dialogue dict or None if invalid.
     """
-    norm_turns = []
-    for turn in conv.get("dialog", []):
-        raw_speaker  = turn.get("speaker", "seeker")
-        role         = "seeker" if raw_speaker == "speaker" else "supporter"
-        content      = turn.get("content", "").strip()
-        raw_strategy = turn.get("annotation", {}).get("strategy") or "Others"
-        strategy     = normalise_strategy(raw_strategy)
+    # Normalise role names
+    turns = []
+    for turn in dlg.get("dialog", []):
+        raw_role = turn.get("speaker", turn.get("role", ""))
+        if raw_role in ("speaker", "seeker"):
+            role = "seeker"
+        elif raw_role in ("listener", "supporter"):
+            role = "supporter"
+        else:
+            continue
 
-        norm_turns.append({
-            "role":     role,
-            "content":  content,
+        # Normalise strategy: try direct field, then annotation sub-field
+        strategy = turn.get("strategy", None)
+        if strategy is None:
+            annotation = turn.get("annotation", {})
+            if isinstance(annotation, dict):
+                strategy = annotation.get("strategy", None)
+
+        turns.append({
+            "role": role,
+            "content": turn.get("content", "").strip(),
             "strategy": strategy,
         })
 
+    if not turns:
+        return None
+
+    # Normalise emotion_intensity
+    intensity = dlg.get("emotion_intensity", None)
+    if intensity is None:
+        intensity = 3
+    try:
+        intensity = int(intensity)
+    except (ValueError, TypeError):
+        intensity = 3
+
     return {
-        "emotion_type":      conv.get("emotion_type", "neutral").lower().strip(),
-        "situation":         conv.get("situation", "").strip(),
-        "emotion_intensity": int(conv.get("emotion_intensity", 3)),
-        "dialog":            norm_turns,
+        "emotion_type":      dlg.get("emotion_type", "neutral").lower(),
+        "problem_type":      dlg.get("problem_type", ""),
+        "situation":         dlg.get("situation", ""),
+        "emotion_intensity": intensity,
+        "dialog":            turns,
     }
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Preprocess ESConv.json for Phase 2")
-    parser.add_argument("--input",     default="data/raw/ESConv.json")
-    parser.add_argument("--out_dir",   default="data/processed")
-    parser.add_argument("--val_frac",  type=float, default=0.15)
-    parser.add_argument("--test_frac", type=float, default=0.15)
-    parser.add_argument("--seed",      type=int,   default=42)
-    args = parser.parse_args()
+def prepare_esconv(
+    input_path: str,
+    out_dir: str,
+    val_frac: float = 0.15,
+    test_frac: float = 0.15,
+    seed: int = 42,
+    window_size: int = 3,
+):
+    print(f"[ESConv] Loading raw data from: {input_path}")
+    with open(input_path, encoding="utf-8") as f:
+        raw_data = json.load(f)
 
-    random.seed(args.seed)
+    # ESConv.json is either a list of dialogues or a dict with a key
+    if isinstance(raw_data, dict):
+        dialogues_raw = list(raw_data.values())
+    elif isinstance(raw_data, list):
+        dialogues_raw = raw_data
+    else:
+        raise ValueError(f"Unexpected ESConv.json format: {type(raw_data)}")
 
-    # ── Load and normalise ─────────────────────────────────────────────────
-    with open(args.input, encoding="utf-8") as f:
-        raw_conversations = json.load(f)
+    print(f"[ESConv] Raw dialogues: {len(dialogues_raw)}")
 
-    print(f"Loaded {len(raw_conversations)} conversations from {args.input}")
-    normalised = [normalise_conversation(c) for c in raw_conversations]
+    # Normalise all dialogues
+    dialogues = []
+    for dlg in dialogues_raw:
+        norm = normalise_dialogue(dlg)
+        if norm is not None:
+            dialogues.append(norm)
+    print(f"[ESConv] Valid dialogues after normalisation: {len(dialogues)}")
 
-    # ── Train / val / test split at conversation level ─────────────────────
-    indices = list(range(len(normalised)))
-    random.shuffle(indices)
-    n_test  = max(1, int(len(indices) * args.test_frac))
-    n_val   = max(1, int(len(indices) * args.val_frac))
-    test_idx = set(indices[:n_test])
-    val_idx  = set(indices[n_test:n_test + n_val])
+    # Stratified split by emotion_type to maintain distribution
+    random.seed(seed)
+    random.shuffle(dialogues)
 
-    train_convs = [normalised[i] for i in indices[n_test + n_val:]]
-    val_convs   = [normalised[i] for i in val_idx]
-    test_convs  = [normalised[i] for i in test_idx]
+    n = len(dialogues)
+    n_test = int(n * test_frac)
+    n_val  = int(n * val_frac)
+    n_train = n - n_test - n_val
 
-    print(f"Split: {len(train_convs)} train | {len(val_convs)} val | {len(test_convs)} test conversations")
+    train_dlgs = dialogues[:n_train]
+    val_dlgs   = dialogues[n_train:n_train + n_val]
+    test_dlgs  = dialogues[n_train + n_val:]
 
-    out = Path(args.out_dir)
-    out.mkdir(parents=True, exist_ok=True)
+    print(f"[ESConv] Split: train={len(train_dlgs)} val={len(val_dlgs)} test={len(test_dlgs)}")
 
-    # ── Write normalised JSON to temp files, then extract QA pairs ─────────
-    with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as tf:
-        json.dump(train_convs, tf)
-        train_tmp = tf.name
+    # Extract QA pairs using sliding window
+    train_pairs = extract_esconv_qa_pairs(train_dlgs, window_size=window_size)
+    val_pairs   = extract_esconv_qa_pairs(val_dlgs,   window_size=window_size)
+    test_pairs  = extract_esconv_qa_pairs(test_dlgs,  window_size=window_size)
 
-    with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as tf:
-        json.dump(val_convs, tf)
-        val_tmp = tf.name
+    print(f"[ESConv] QA pairs extracted: train={len(train_pairs)} val={len(val_pairs)} test={len(test_pairs)}")
 
-    with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as tf:
-        json.dump(test_convs, tf)
-        test_tmp = tf.name
+    # Write JSONL splits
+    os.makedirs(out_dir, exist_ok=True)
+    for split_name, pairs in [("train", train_pairs), ("val", val_pairs), ("test", test_pairs)]:
+        path = os.path.join(out_dir, f"esconv_{split_name}.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            for pair in pairs:
+                f.write(json.dumps(pair, ensure_ascii=False) + "\n")
+        print(f"[ESConv] Wrote {len(pairs)} pairs → {path}")
 
-    train_out = str(out / "esconv_train.jsonl")
-    val_out   = str(out / "esconv_val.jsonl")
-    test_out  = str(out / "esconv_test.jsonl")
+    # Compute strategy class frequencies (train split only)
+    strategy_counts = Counter()
+    for pair in train_pairs:
+        sid = pair.get("strategy_label", -1)
+        if sid >= 0:
+            strategy_counts[sid] += 1
 
-    # extract_esconv_qa_pairs handles: sliding window, metadata tokens,
-    # strategy token prepended to target, emotion/strategy integer IDs.
-    print("Extracting train QA pairs ...")
-    strategy_counter = extract_esconv_qa_pairs(
-        esconv_json_path=train_tmp,
-        output_path=train_out,
-        window_size=3,
-    )
-
-    print("Extracting val QA pairs ...")
-    extract_esconv_qa_pairs(
-        esconv_json_path=val_tmp,
-        output_path=val_out,
-        window_size=3,
-    )
-
-    print("Extracting test QA pairs ...")
-    extract_esconv_qa_pairs(
-        esconv_json_path=test_tmp,
-        output_path=test_out,
-        window_size=3,
-    )
-
-    os.unlink(train_tmp)
-    os.unlink(val_tmp)
-    os.unlink(test_tmp)
-
-    # ── Write strategy counts for class-weighted loss ──────────────────────
-    counts_path = str(out / "strategy_counts.json")
+    counts_path = os.path.join(out_dir, "strategy_counts.json")
     with open(counts_path, "w") as f:
-        json.dump(dict(strategy_counter), f, indent=2)
-    print(f"Strategy counts -> {counts_path}")
-    print(" ", dict(strategy_counter))
+        json.dump({str(k): v for k, v in sorted(strategy_counts.items())}, f, indent=2)
+    print(f"[ESConv] Strategy counts → {counts_path}")
 
-    # ── Summary ────────────────────────────────────────────────────────────
-    with open(train_out) as f:
-        n_train = sum(1 for _ in f)
-    with open(val_out) as f:
-        n_val_pairs = sum(1 for _ in f)
-    with open(test_out) as f:
-        n_test_pairs = sum(1 for _ in f)
-    print(f"\nDone. Train pairs: {n_train}, Val pairs: {n_val_pairs}, Test pairs: {n_test_pairs}")
-    print(f"Files written to {out}/")
+    # Print strategy distribution
+    print("\n[ESConv] Strategy distribution in train split:")
+    total = sum(strategy_counts.values())
+    for sid in sorted(strategy_counts.keys()):
+        name = CANONICAL_STRATEGIES[sid] if sid < len(CANONICAL_STRATEGIES) else f"id:{sid}"
+        count = strategy_counts[sid]
+        pct = 100 * count / max(1, total)
+        print(f"  [{sid}] {name:<35} {count:5d}  ({pct:.1f}%)")
+
+    return train_pairs, val_pairs, test_pairs
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--input",     default="data/raw/ESConv.json")
+    p.add_argument("--out_dir",   default="data/processed")
+    p.add_argument("--val_frac",  type=float, default=0.15)
+    p.add_argument("--test_frac", type=float, default=0.15)
+    p.add_argument("--seed",      type=int,   default=42)
+    return p.parse_args()
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    prepare_esconv(
+        input_path=args.input,
+        out_dir=args.out_dir,
+        val_frac=args.val_frac,
+        test_frac=args.test_frac,
+        seed=args.seed,
+    )

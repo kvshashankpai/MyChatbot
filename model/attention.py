@@ -1,153 +1,104 @@
 """
-model/attention.py — Scaled Dot-Product and Multi-Head Attention
-
-WHY this is a standalone module:
-  The same MultiHeadAttention class is reused for THREE purposes:
-    1. Encoder self-attention (bidirectional, padding mask only)
-    2. Decoder masked self-attention (causal + padding mask)
-    3. Decoder cross-attention (Q from decoder, K/V from encoder memory)
-
-  Centralising avoids code duplication and ensures all three share identical
-  weight shapes, making weight-loading and debugging straightforward.
-
-Spec constraints enforced here:
-  • d_model = 256, num_heads = 2  →  d_k = d_v = 128 per head
-  • Scaling factor = sqrt(128) ≈ 11.31 (prevents softmax saturation)
-  • Dropout applied to attention weights (post-softmax)
+attention.py — Scaled Dot-Product Attention + Multi-Head Attention
+Reused identically for:
+  (1) Encoder self-attention (bidirectional, padding mask only)
+  (2) Decoder masked self-attention (causal + padding mask)
+  (3) Decoder cross-attention (Q from decoder, K/V from encoder memory)
 """
 
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple
 
 
 def scaled_dot_product_attention(
-    query: torch.Tensor,    # (B, h, T_q, d_k)
-    key:   torch.Tensor,    # (B, h, T_k, d_k)
-    value: torch.Tensor,    # (B, h, T_k, d_k)
-    mask:  Optional[torch.Tensor] = None,   # broadcast-compatible boolean mask
-    dropout: Optional[nn.Dropout] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    q: torch.Tensor,          # (B, H, T_q, d_k)
+    k: torch.Tensor,          # (B, H, T_k, d_k)
+    v: torch.Tensor,          # (B, H, T_k, d_v)
+    mask: torch.Tensor = None,  # (B, 1, T_q, T_k) or (B, 1, 1, T_k)  — True = keep, False = mask out
+    dropout: nn.Dropout = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Scaled dot-product attention as defined in 'Attention Is All You Need'.
-
-    Attention(Q, K, V) = softmax(QK^T / sqrt(d_k)) * V
-
-    Mask convention:
-      mask = True at positions that should be IGNORED (set to -inf before softmax).
-      This covers both padding positions and causal (future) positions.
-
-    Args:
-        query, key, value: Attention tensors.
-        mask:  Boolean tensor. True = block this position.
-        dropout: Optional dropout applied to attention weights.
-
-    Returns:
-        Tuple of (attended_values, attention_weights).
-        attention_weights shape: (B, h, T_q, T_k) — used for visualization.
+    Core attention computation. Returns (output, attention_weights).
+    mask convention: True = ATTEND, False = IGNORE (masked out with -inf).
+    This is the most common source of bugs — we enforce it here strictly.
     """
-    d_k = query.size(-1)
-    # Scale prevents vanishing gradients in softmax with large d_k
-    scale = math.sqrt(d_k)
+    d_k = q.size(-1)
+    # Scores: (B, H, T_q, T_k)
+    scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d_k)
 
-    # Compute raw attention scores: (B, h, T_q, T_k)
-    scores = torch.matmul(query, key.transpose(-2, -1)) / scale
-
-    # Apply mask: replace masked positions with large negative value
-    # so they become ~0 after softmax
     if mask is not None:
-        scores = scores.masked_fill(mask, -1e9)
+        # Where mask is False (i.e. should be masked OUT), set to -inf
+        scores = scores.masked_fill(mask == 0, float("-inf"))
 
-    # Softmax over key dimension
     attn_weights = F.softmax(scores, dim=-1)
 
-    # NaN guard: if entire row was masked → softmax produces NaN → replace with 0
+    # After softmax, -inf positions become 0 (nan guard for all-masked rows)
     attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
 
     if dropout is not None:
         attn_weights = dropout(attn_weights)
 
-    # Weighted sum of values: (B, h, T_q, d_v)
-    output = torch.matmul(attn_weights, value)
+    output = torch.matmul(attn_weights, v)  # (B, H, T_q, d_v)
     return output, attn_weights
 
 
 class MultiHeadAttention(nn.Module):
     """
     Multi-Head Attention module.
-
-    Spec constraints (Section 5.1):
-      d_model = 256, num_heads = 2  →  d_k = d_v = d_model // num_heads = 128
-
-    The same module handles:
-      • Self-attention:  query=key=value=x
-      • Cross-attention: query=decoder_hidden, key=value=encoder_memory
-
-    Args:
-        d_model:   Model dimensionality (256).
-        num_heads: Number of parallel attention heads (2).
-        dropout:   Dropout rate on attention weights (0.1 per spec).
+    d_model=256, num_heads=2  →  d_k = d_v = 128 per head.
+    No separate head-splitting complexity: we use reshape + transpose.
     """
 
-    def __init__(self, d_model: int = 256, num_heads: int = 2, dropout: float = 0.1):
+    def __init__(self, d_model: int, num_heads: int, dropout: float = 0.1):
         super().__init__()
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads  # 128
 
-        assert d_model % num_heads == 0, (
-            f"d_model ({d_model}) must be divisible by num_heads ({num_heads})"
-        )
-
-        self.d_model    = d_model
-        self.num_heads  = num_heads
-        self.d_k        = d_model // num_heads   # 128 per head
-
+        # Fused Q, K, V projections for efficiency
         self.W_q = nn.Linear(d_model, d_model, bias=False)
         self.W_k = nn.Linear(d_model, d_model, bias=False)
         self.W_v = nn.Linear(d_model, d_model, bias=False)
         self.W_o = nn.Linear(d_model, d_model, bias=False)
 
-        self.attn_dropout = nn.Dropout(dropout)
-
+        self.dropout = nn.Dropout(dropout)
         self._init_weights()
 
     def _init_weights(self):
-        """Xavier uniform initialization for all projection matrices."""
         for module in [self.W_q, self.W_k, self.W_v, self.W_o]:
             nn.init.xavier_uniform_(module.weight)
 
-    def split_heads(self, x: torch.Tensor) -> torch.Tensor:
-        """Reshape (B, T, d_model) → (B, num_heads, T, d_k)."""
-        B, T, _ = x.shape
-        return x.view(B, T, self.num_heads, self.d_k).transpose(1, 2)
+    def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
+        """(B, T, d_model) → (B, H, T, d_k)"""
+        B, T, _ = x.size()
+        x = x.view(B, T, self.num_heads, self.d_k)
+        return x.transpose(1, 2)  # (B, H, T, d_k)
 
-    def combine_heads(self, x: torch.Tensor) -> torch.Tensor:
-        """Reverse split_heads: (B, num_heads, T, d_k) → (B, T, d_model)."""
-        B, h, T, d_k = x.shape
-        return x.transpose(1, 2).contiguous().view(B, T, self.d_model)
+    def _merge_heads(self, x: torch.Tensor) -> torch.Tensor:
+        """(B, H, T, d_k) → (B, T, d_model)"""
+        B, H, T, d_k = x.size()
+        x = x.transpose(1, 2).contiguous()
+        return x.view(B, T, self.d_model)
 
     def forward(
         self,
-        query: torch.Tensor,                    # (B, T_q, d_model)
-        key:   torch.Tensor,                    # (B, T_k, d_model)
-        value: torch.Tensor,                    # (B, T_k, d_model)
-        mask:  Optional[torch.Tensor] = None,   # True = blocked position
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Forward pass.
-
-        Returns:
-            output:        (B, T_q, d_model)
-            attn_weights:  (B, num_heads, T_q, T_k)  — for visualization
-        """
-        Q = self.split_heads(self.W_q(query))
-        K = self.split_heads(self.W_k(key))
-        V = self.split_heads(self.W_v(value))
+        query: torch.Tensor,    # (B, T_q, d_model)
+        key: torch.Tensor,      # (B, T_k, d_model)
+        value: torch.Tensor,    # (B, T_k, d_model)
+        mask: torch.Tensor = None,  # (B, 1, T_q, T_k) — True=attend, False=ignore
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        q = self._split_heads(self.W_q(query))   # (B, H, T_q, d_k)
+        k = self._split_heads(self.W_k(key))     # (B, H, T_k, d_k)
+        v = self._split_heads(self.W_v(value))   # (B, H, T_k, d_k)
 
         attn_out, attn_weights = scaled_dot_product_attention(
-            Q, K, V, mask=mask, dropout=self.attn_dropout
+            q, k, v, mask=mask, dropout=self.dropout
         )
 
-        output = self.W_o(self.combine_heads(attn_out))
-
-        return output, attn_weights
+        # Merge heads and project back
+        merged = self._merge_heads(attn_out)     # (B, T_q, d_model)
+        output = self.W_o(merged)
+        return output, attn_weights  # attn_weights: (B, H, T_q, T_k)
