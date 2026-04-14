@@ -75,7 +75,12 @@ def evaluate(model, loader, loss_fn, device):
 
 def main():
     args   = parse_args()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     print(f"[Phase 1] device={device}")
 
     from tokenizers import Tokenizer
@@ -87,8 +92,8 @@ def main():
     train_ds = HappyBotDataset(os.path.join(args.data_dir, "empathetic_train.jsonl"), tok, phase=1)
     val_ds   = HappyBotDataset(os.path.join(args.data_dir, "empathetic_val.jsonl"),   tok, phase=1)
     cfn      = lambda b: collate_fn(b, pad_id=pad_id)
-    train_loader = DataLoader(train_ds, args.batch_size, shuffle=True,  collate_fn=cfn, num_workers=2, pin_memory=True)
-    val_loader   = DataLoader(val_ds,   args.batch_size, shuffle=False, collate_fn=cfn, num_workers=2)
+    train_loader = DataLoader(train_ds, args.batch_size, shuffle=True,  collate_fn=cfn, num_workers=0)
+    val_loader   = DataLoader(val_ds,   args.batch_size, shuffle=False, collate_fn=cfn, num_workers=0)
     print(f"[Phase 1] train={len(train_ds)}  val={len(val_ds)}")
 
     model = HappyBot(

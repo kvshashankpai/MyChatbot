@@ -172,6 +172,15 @@ def collate_fn(batch: list[dict], pad_id: int = 0) -> dict:
     # Decoder targets: pad with -100 (CrossEntropyLoss ignore_index)
     decoder_target_ids = pad_sequence([b["decoder_target_ids"] for b in batch], -100)
 
+    # Ensure decoder_input_ids and decoder_target_ids have the same length
+    max_decoder_len = max(decoder_input_ids.size(1), decoder_target_ids.size(1))
+    if decoder_input_ids.size(1) < max_decoder_len:
+        pad_tensor = torch.full((decoder_input_ids.size(0), max_decoder_len - decoder_input_ids.size(1)), pad_id, dtype=torch.long)
+        decoder_input_ids = torch.cat([decoder_input_ids, pad_tensor], dim=1)
+    if decoder_target_ids.size(1) < max_decoder_len:
+        pad_tensor = torch.full((decoder_target_ids.size(0), max_decoder_len - decoder_target_ids.size(1)), -100, dtype=torch.long)
+        decoder_target_ids = torch.cat([decoder_target_ids, pad_tensor], dim=1)
+
     emotion_labels  = torch.stack([b["emotion_label"]  for b in batch])
     strategy_labels = torch.stack([b["strategy_label"] for b in batch])
 
