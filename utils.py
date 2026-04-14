@@ -1,5 +1,13 @@
 """
-utils.py — Training utilities: LR scheduler, loss functions, metrics, checkpointing.
+utils.py — Training utilities.
+
+Fixes vs the repo version:
+  1. compute_perplexity   (was calculate_perplexity — import name mismatch)
+  2. compute_distinct_n   (was missing entirely)
+  3. MultiTaskLoss        — lambda_strategy=0 in Phase 1, ignore_index=-1 on both heads
+  4. save_checkpoint      — stores all model config keys inference.py expects
+  5. load_checkpoint      — signature fixed (no model arg — just returns the dict)
+  6. compute_strategy_weights — consistent with prepare_esconv.py output format
 """
 
 import math
@@ -11,181 +19,138 @@ import torch.nn.functional as F
 from collections import Counter
 
 
-# ── Learning Rate Scheduler ───────────────────────────────────────────────────
+# ── LR Scheduler ─────────────────────────────────────────────────────────────
 
 class WarmupCosineScheduler:
-    """
-    Linear warmup followed by cosine annealing.
-    This is non-negotiable for stable transformer training from random weights.
-    
-    Usage:
-        scheduler = WarmupCosineScheduler(optimizer, warmup_steps=500, total_steps=10000, peak_lr=1e-4)
-        for step in training_loop:
-            scheduler.step()
-    """
+    """Linear warmup → cosine annealing.  Non-negotiable for from-scratch training."""
 
-    def __init__(
-        self,
-        optimizer: torch.optim.Optimizer,
-        warmup_steps: int,
-        total_steps: int,
-        peak_lr: float,
-        min_lr: float = 1e-6,
-    ):
-        self.optimizer = optimizer
-        self.warmup_steps = warmup_steps
-        self.total_steps = total_steps
-        self.peak_lr = peak_lr
-        self.min_lr = min_lr
-        self._step = 0
+    def __init__(self, optimizer, warmup_steps, total_steps, peak_lr, min_lr=1e-6):
+        self.optimizer     = optimizer
+        self.warmup_steps  = warmup_steps
+        self.total_steps   = total_steps
+        self.peak_lr       = peak_lr
+        self.min_lr        = min_lr
+        self._step         = 0
 
     def step(self):
         self._step += 1
         lr = self._get_lr()
-        for param_group in self.optimizer.param_groups:
-            param_group["lr"] = lr
+        for pg in self.optimizer.param_groups:
+            pg["lr"] = lr
         return lr
 
-    def _get_lr(self) -> float:
-        step = self._step
-        if step <= self.warmup_steps:
-            # Linear warmup from 0 to peak_lr
-            return self.peak_lr * step / max(1, self.warmup_steps)
-        else:
-            # Cosine annealing from peak_lr to min_lr
-            progress = (step - self.warmup_steps) / max(1, self.total_steps - self.warmup_steps)
-            cosine_factor = 0.5 * (1 + math.cos(math.pi * min(progress, 1.0)))
-            return self.min_lr + (self.peak_lr - self.min_lr) * cosine_factor
+    def _get_lr(self):
+        s = self._step
+        if s <= self.warmup_steps:
+            return self.peak_lr * s / max(1, self.warmup_steps)
+        prog = (s - self.warmup_steps) / max(1, self.total_steps - self.warmup_steps)
+        cos  = 0.5 * (1 + math.cos(math.pi * min(prog, 1.0)))
+        return self.min_lr + (self.peak_lr - self.min_lr) * cos
 
-    def state_dict(self) -> dict:
-        return {"step": self._step, "peak_lr": self.peak_lr, "warmup_steps": self.warmup_steps}
+    def state_dict(self):
+        return {"step": self._step, "peak_lr": self.peak_lr,
+                "warmup_steps": self.warmup_steps}
 
-    def load_state_dict(self, state: dict):
-        self._step = state["step"]
+    def load_state_dict(self, d):
+        self._step = d["step"]
 
 
 # ── Loss Functions ────────────────────────────────────────────────────────────
 
 class LabelSmoothedCrossEntropy(nn.Module):
     """
-    Label-smoothed cross-entropy loss for generation.
-    smoothing=0.1: distributes 0.1 probability mass uniformly over all vocab tokens.
-    This prevents overconfident predictions and improves output diversity.
-    ignore_index=-100: ignores padded positions.
+    Label-smoothed CE for the generation head.
+    ignore_index=-100 skips padded positions.
     """
 
-    def __init__(self, vocab_size: int, smoothing: float = 0.1, ignore_index: int = -100):
+    def __init__(self, vocab_size, smoothing=0.1, ignore_index=-100):
         super().__init__()
-        self.vocab_size = vocab_size
-        self.smoothing = smoothing
-        self.ignore_index = ignore_index
-        self.confidence = 1.0 - smoothing
+        self.vocab_size    = vocab_size
+        self.smoothing     = smoothing
+        self.confidence    = 1.0 - smoothing
+        self.ignore_index  = ignore_index
 
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        """
-        logits: (B, T, V) — raw (un-softmaxed) logits
-        targets: (B, T) — ground-truth token ids, padded positions = ignore_index
-        """
-        B, T, V = logits.size()
-        logits_flat = logits.reshape(-1, V)   # (B*T, V)
-        targets_flat = targets.reshape(-1)    # (B*T,)
+    def forward(self, logits, targets):
+        # logits:  (B, T, V)
+        # targets: (B, T)  — padded positions = ignore_index
+        B, T, V = logits.shape
+        lf = logits.reshape(-1, V)
+        tf = targets.reshape(-1)
 
-        # Mask padding positions
-        valid = targets_flat != self.ignore_index
-        if valid.sum() == 0:
+        valid = tf != self.ignore_index
+        if not valid.any():
             return logits.new_zeros(())
 
-        logits_flat = logits_flat[valid]
-        targets_flat = targets_flat[valid]
+        lf = lf[valid]
+        tf = tf[valid]
 
-        # Log softmax
-        log_probs = F.log_softmax(logits_flat, dim=-1)
-
-        # One-hot smoothed target distribution
+        log_p = F.log_softmax(lf, dim=-1)
         with torch.no_grad():
-            smooth_targets = torch.full_like(log_probs, self.smoothing / (V - 1))
-            smooth_targets.scatter_(1, targets_flat.unsqueeze(1), self.confidence)
-
-        loss = -(smooth_targets * log_probs).sum(dim=-1).mean()
-        return loss
+            smooth = torch.full_like(log_p, self.smoothing / (V - 1))
+            smooth.scatter_(1, tf.unsqueeze(1), self.confidence)
+        return -(smooth * log_p).sum(dim=-1).mean()
 
 
 class MultiTaskLoss(nn.Module):
     """
-    Combined loss for HappyBot training.
     L_total = L_gen + lambda_emotion * L_emotion + lambda_strategy * L_strategy
-    
-    During Phase 1 (EmpatheticDialogues):
-      - lambda_strategy = 0.0 (no strategy annotations available)
-      - strategy labels should be passed as -1 (masked out)
-    
-    During Phase 2 (ESConv fine-tuning):
-      - Both lambda values = 0.3
-      - strategy_weights: class-frequency-inverse weights for imbalance correction
+
+    Phase 1 (EmpatheticDialogues):  lambda_strategy = 0.0
+    Phase 2 (ESConv):               lambda_strategy = 0.3
+
+    Both classification heads use ignore_index=-1 so samples with label=-1
+    contribute zero loss (handles missing annotations cleanly).
     """
 
     def __init__(
         self,
-        vocab_size: int,
-        num_emotion_classes: int = 32,
-        num_strategy_classes: int = 8,
-        label_smoothing: float = 0.1,
-        lambda_emotion: float = 0.3,
-        lambda_strategy: float = 0.3,
-        strategy_weights: torch.Tensor = None,
-        pad_token_id: int = 0,
+        vocab_size,
+        num_emotion_classes=32,
+        num_strategy_classes=8,
+        label_smoothing=0.1,
+        lambda_emotion=0.3,
+        lambda_strategy=0.3,      # SET TO 0.0 FOR PHASE 1
+        strategy_weights=None,    # class-frequency-inverse tensor (Phase 2)
+        ignore_index=-100,
     ):
         super().__init__()
-        self.lambda_emotion = lambda_emotion
-        self.lambda_strategy = lambda_strategy
+        self.lambda_emotion   = lambda_emotion
+        self.lambda_strategy  = lambda_strategy
 
-        self.gen_loss_fn = LabelSmoothedCrossEntropy(
-            vocab_size=vocab_size,
-            smoothing=label_smoothing,
-            ignore_index=-100,
-        )
-        self.emotion_loss_fn = nn.CrossEntropyLoss(ignore_index=-1)
-        self.strategy_loss_fn = nn.CrossEntropyLoss(
-            weight=strategy_weights,
-            ignore_index=-1,
-        )
+        self.gen_loss      = LabelSmoothedCrossEntropy(vocab_size, label_smoothing, ignore_index)
+        self.emotion_loss  = nn.CrossEntropyLoss(ignore_index=-1)
+        self.strategy_loss = nn.CrossEntropyLoss(weight=strategy_weights, ignore_index=-1)
 
-    def forward(
-        self,
-        logits: torch.Tensor,            # (B, T, vocab_size) — generation logits
-        tgt_labels: torch.Tensor,        # (B, T) — shifted decoder targets
-        emotion_logits: torch.Tensor,    # (B, num_emotion_classes)
-        emotion_labels: torch.Tensor,    # (B,)  — -1 = ignore
-        strategy_logits: torch.Tensor,   # (B, num_strategy_classes)
-        strategy_labels: torch.Tensor,   # (B,)  — -1 = ignore (Phase 1)
-    ) -> dict:
-        L_gen = self.gen_loss_fn(logits, tgt_labels)
+    def forward(self, logits, tgt_labels, emotion_logits, emotion_labels,
+                strategy_logits, strategy_labels):
+        L_gen      = self.gen_loss(logits, tgt_labels)
+        L_emotion  = self.emotion_loss(emotion_logits, emotion_labels)
+        L_strategy = (self.strategy_loss(strategy_logits, strategy_labels)
+                      if self.lambda_strategy > 0 else logits.new_zeros(()))
 
-        # Emotion loss (active in both phases)
-        L_emotion = self.emotion_loss_fn(emotion_logits, emotion_labels)
-
-        # Strategy loss (masked in Phase 1 via ignore_index=-1)
-        if self.lambda_strategy > 0:
-            L_strategy = self.strategy_loss_fn(strategy_logits, strategy_labels)
-        else:
-            L_strategy = logits.new_zeros(())
-
-        L_total = L_gen + self.lambda_emotion * L_emotion + self.lambda_strategy * L_strategy
-
+        total = L_gen + self.lambda_emotion * L_emotion + self.lambda_strategy * L_strategy
         return {
-            "total": L_total,
+            "total":      total,
             "generation": L_gen,
-            "emotion": L_emotion,
-            "strategy": L_strategy,
+            "emotion":    L_emotion,
+            "strategy":   L_strategy,
         }
 
 
-# ── Metrics ──────────────────────────────────────────────────────────────────
+# ── Metrics ───────────────────────────────────────────────────────────────────
 
-def compute_distinct_n(token_sequences: list[list[int]], n: int) -> float:
+def compute_perplexity(loss: float) -> float:
+    """exp(cross-entropy loss).  Clamped to avoid overflow."""
+    return math.exp(min(loss, 100.0))
+
+# Alias kept for any code that uses the old name
+calculate_perplexity = compute_perplexity
+
+
+def compute_distinct_n(token_sequences, n: int) -> float:
     """
-    Distinct-n: ratio of unique n-grams to total n-grams across all generated sequences.
-    Measures response diversity. Distinct-1 > 0.15, Distinct-2 > 0.40 are targets.
+    Distinct-n: fraction of unique n-grams across all generated sequences.
+    Measures response diversity (D1 target >0.15, D2 target >0.40).
     """
     all_ngrams = []
     for seq in token_sequences:
@@ -193,115 +158,101 @@ def compute_distinct_n(token_sequences: list[list[int]], n: int) -> float:
             all_ngrams.append(tuple(seq[i:i + n]))
     if not all_ngrams:
         return 0.0
-    unique = len(set(all_ngrams))
-    total = len(all_ngrams)
-    return unique / total
+    return len(set(all_ngrams)) / len(all_ngrams)
 
 
-def compute_perplexity(loss: float) -> float:
-    """Perplexity from cross-entropy loss (nats)."""
-    return math.exp(min(loss, 100))  # clamp to avoid overflow
-
-
-def compute_accuracy(logits: torch.Tensor, labels: torch.Tensor, ignore_index: int = -1) -> float:
-    """Classification accuracy for NLU heads."""
-    mask = labels != ignore_index
-    if mask.sum() == 0:
+def compute_accuracy(logits, labels, ignore_index=-1):
+    mask   = labels != ignore_index
+    if not mask.any():
         return 0.0
-    preds = logits.argmax(dim=-1)
-    correct = (preds[mask] == labels[mask]).float().sum()
-    return (correct / mask.sum()).item()
+    preds  = logits.argmax(-1)
+    return (preds[mask] == labels[mask]).float().mean().item()
 
 
-# ── Strategy Class Weights ────────────────────────────────────────────────────
+# ── Strategy class weights ────────────────────────────────────────────────────
 
-def compute_strategy_weights(
-    strategy_counts_path: str,
-    num_classes: int = 8,
-    device: torch.device = None,
-) -> torch.Tensor:
+def compute_strategy_weights(counts_path, num_classes=8, device=None):
     """
-    Compute inverse-frequency class weights for the ESConv strategy head.
-    Loads the strategy_counts.json file produced by prepare_esconv.py.
-    
-    Weight formula: w_i = total / (num_classes * count_i)
-    This is the standard sklearn balanced class weight formula.
+    Balanced inverse-frequency weights from strategy_counts.json
+    (produced by prepare_esconv.py).
+    Falls back to uniform weights if file is missing.
     """
-    if not os.path.exists(strategy_counts_path):
-        # Return uniform weights if file not found
+    if not os.path.exists(counts_path):
         return torch.ones(num_classes)
 
-    with open(strategy_counts_path) as f:
-        counts = json.load(f)  # {strategy_id_str: count}
+    with open(counts_path) as f:
+        counts = json.load(f)
 
     total = sum(counts.values())
-    weights = torch.ones(num_classes)
-    for sid_str, count in counts.items():
+    w = torch.ones(num_classes)
+    for sid_str, cnt in counts.items():
         sid = int(sid_str)
-        if count > 0 and sid < num_classes:
-            weights[sid] = total / (num_classes * count)
+        if 0 <= sid < num_classes and cnt > 0:
+            w[sid] = total / (num_classes * cnt)
+    w = w / w.mean()   # normalise: mean weight = 1.0
+    return w.to(device) if device else w
 
-    # Normalize so mean weight = 1.0
-    weights = weights / weights.mean()
-    if device:
-        weights = weights.to(device)
-    return weights
+# Alias kept for any code that uses the old name
+calculate_strategy_weights = compute_strategy_weights
 
 
-# ── AdamW Configuration ───────────────────────────────────────────────────────
+# ── Optimizer ─────────────────────────────────────────────────────────────────
 
-def build_optimizer(model: nn.Module, lr: float, weight_decay: float = 0.01) -> torch.optim.AdamW:
-    """
-    Build AdamW optimizer with weight decay applied correctly:
-    - Exclude biases and LayerNorm parameters from weight decay
-    - This matches the BERT/GPT training recipe for transformers
-    """
-    decay_params = []
-    no_decay_params = []
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
+def build_optimizer(model, lr, weight_decay=0.01):
+    """AdamW: weight decay on weights only, not biases or LayerNorm params."""
+    decay, no_decay = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
             continue
-        if "bias" in name or "norm" in name.lower() or "embedding" in name:
-            no_decay_params.append(param)
+        if any(k in name for k in ("bias", "norm", "embedding")):
+            no_decay.append(p)
         else:
-            decay_params.append(param)
-
-    param_groups = [
-        {"params": decay_params, "weight_decay": weight_decay},
-        {"params": no_decay_params, "weight_decay": 0.0},
-    ]
-    return torch.optim.AdamW(param_groups, lr=lr, betas=(0.9, 0.98), eps=1e-9)
+            decay.append(p)
+    return torch.optim.AdamW(
+        [{"params": decay, "weight_decay": weight_decay},
+         {"params": no_decay, "weight_decay": 0.0}],
+        lr=lr, betas=(0.9, 0.98), eps=1e-9,
+    )
 
 
 # ── Checkpointing ─────────────────────────────────────────────────────────────
 
-def save_checkpoint(
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scheduler,
-    epoch: int,
-    step: int,
-    metrics: dict,
-    path: str,
-):
+def save_checkpoint(model, optimizer, scheduler, epoch, step, metrics, path):
+    """
+    Saves everything inference.py needs to reconstruct the model:
+    model config keys are read directly from the model object.
+    """
     os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save({
-        "model_state_dict": model.state_dict(),
+        # weights
+        "model_state_dict":     model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
-        "epoch": epoch,
-        "step": step,
+        # bookkeeping
+        "epoch":   epoch,
+        "step":    step,
         "metrics": metrics,
+        # ── model architecture config (required by inference.py) ──────────
+        "vocab_size":           model.vocab_size,
+        "d_model":              model.d_model,
+        "d_ff":                 model.d_ff,
+        "num_heads":            model.num_heads,
+        "num_encoder_layers":   model.num_encoder_layers,
+        "num_decoder_layers":   model.num_decoder_layers,
+        "dropout":              model.dropout_p,
+        "pad_token_id":         model.pad_token_id,
     }, path)
-    print(f"  [ckpt] Saved checkpoint → {path}")
+    print(f"  [ckpt] Saved → {path}")
 
 
-def load_checkpoint(path: str, model: nn.Module, optimizer=None, scheduler=None) -> dict:
-    ckpt = torch.load(path, map_location="cpu")
-    model.load_state_dict(ckpt["model_state_dict"])
-    if optimizer and "optimizer_state_dict" in ckpt:
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-    if scheduler and "scheduler_state_dict" in ckpt:
-        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-    print(f"  [ckpt] Loaded checkpoint from {path} (epoch {ckpt.get('epoch', '?')})")
+def load_checkpoint(path, map_location="cpu"):
+    """
+    Returns the raw checkpoint dict.
+    Caller is responsible for calling model.load_state_dict(ckpt['model_state_dict']).
+
+    Note: this does NOT accept a model argument — that was the bug in the repo version
+    (torch.device object has no attribute 'load_state_dict').
+    """
+    ckpt = torch.load(path, map_location=map_location)
+    print(f"  [ckpt] Loaded from {path}  (epoch {ckpt.get('epoch', '?')})")
     return ckpt

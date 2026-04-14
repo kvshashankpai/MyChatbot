@@ -1,14 +1,11 @@
 """
-decoder.py — Transformer Decoder stack.
-Includes:
-  - DecoderLayer (masked MHA + cross-attention + FFN)
-  - Decoder (embedding + PE + stack + output projection)
-  
-Key correctness invariants enforced here:
-  1. Causal (upper-triangular) mask prevents position i from attending to i+1..T
-  2. Cross-attention: Q from decoder hidden state, K and V from encoder memory
-  3. Output projection weight is TIED to the input embedding matrix (set externally)
-  4. Pre-norm (LayerNorm before each sublayer) for training stability from random init
+model/decoder.py
+
+Transformer Decoder with:
+  - PRE-NORM residual connections (same reason as encoder)
+  - Causal (upper-triangular) mask for autoregressive self-attention
+  - Cross-attention: Q from decoder, K/V from encoder memory (H_enc)
+  - Weight-tied output projection (set by HappyBot after construction)
 """
 
 import math
@@ -18,76 +15,53 @@ from model.attention import MultiHeadAttention
 from model.encoder import SinusoidalPositionalEncoding, FeedForward
 
 
+# ── Decoder Layer (PRE-NORM) ──────────────────────────────────────────────────
+
 class DecoderLayer(nn.Module):
     """
-    Single decoder layer with three sublayers:
-      1. Masked multi-head self-attention (causal)
-      2. Cross-attention (Q from decoder, K/V from encoder memory)
-      3. Position-wise FFN
-    All with pre-norm + residual connections.
+    Three pre-norm sublayers:
+        1. Masked self-attention  (causal)
+        2. Cross-attention        (Q=decoder, K/V=encoder memory)
+        3. FFN
     """
 
     def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout: float = 0.1):
         super().__init__()
-        self.self_attn = MultiHeadAttention(d_model, num_heads, dropout)
-        self.cross_attn = MultiHeadAttention(d_model, num_heads, dropout)
-        self.ffn = FeedForward(d_model, d_ff, dropout)
-
+        self.self_attn   = MultiHeadAttention(d_model, num_heads, dropout)
+        self.cross_attn  = MultiHeadAttention(d_model, num_heads, dropout)
+        self.ffn         = FeedForward(d_model, d_ff, dropout)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.norm3 = nn.LayerNorm(d_model)
-        self.dropout = nn.Dropout(dropout)
+        self.drop  = nn.Dropout(dropout)
 
-    def forward(
-        self,
-        x: torch.Tensor,           # (B, T_tgt, d_model)
-        memory: torch.Tensor,      # (B, T_src, d_model) — encoder output
-        tgt_mask: torch.Tensor,    # (B, 1, T_tgt, T_tgt) — causal mask (True=attend)
-        src_mask: torch.Tensor,    # (B, 1, 1, T_src) — encoder padding mask (True=attend)
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Returns:
-          x: (B, T_tgt, d_model)
-          self_attn_weights: (B, H, T_tgt, T_tgt)
-          cross_attn_weights: (B, H, T_tgt, T_src)  ← crucial for interpretability
-        """
-        # 1. Masked self-attention (decoder attends to its own past)
-        residual = x
-        x_norm = self.norm1(x)
-        self_out, self_attn_w = self.self_attn(x_norm, x_norm, x_norm, mask=tgt_mask)
-        x = residual + self.dropout(self_out)
+    def forward(self, x, memory, tgt_mask, src_mask):
+        # 1. Masked self-attention
+        n = self.norm1(x)
+        sa_out, sa_w = self.self_attn(n, n, n, tgt_mask)
+        x = x + self.drop(sa_out)
 
-        # 2. Cross-attention (decoder queries encoder memory)
-        residual = x
-        x_norm = self.norm2(x)
-        cross_out, cross_attn_w = self.cross_attn(
-            query=x_norm,
-            key=memory,
-            value=memory,
-            mask=src_mask,
-        )
-        x = residual + self.dropout(cross_out)
+        # 2. Cross-attention  ← Q from decoder hidden state, K/V from encoder
+        n = self.norm2(x)
+        ca_out, ca_w = self.cross_attn(n, memory, memory, src_mask)
+        x = x + self.drop(ca_out)
 
         # 3. FFN
-        residual = x
-        x = residual + self.dropout(self.ffn(self.norm3(x)))
+        x = x + self.drop(self.ffn(self.norm3(x)))
 
-        return x, self_attn_w, cross_attn_w
+        return x, sa_w, ca_w
 
+
+# ── Full Decoder ──────────────────────────────────────────────────────────────
 
 class Decoder(nn.Module):
     """
-    Full Decoder stack.
-    Like the Encoder, this does NOT own the input embedding — it receives it
-    from HappyBot to enforce weight tying with the encoder embedding.
-    
-    Weight tying: output_proj.weight == embedding.weight (set in HappyBot.__init__)
-    This saves 256 * 10,000 = 2.56M parameters and improves perplexity.
+    embedding and output_proj.weight are set/tied by HappyBot — do NOT own them here.
     """
 
     def __init__(
         self,
-        embedding: nn.Embedding,    # shared embedding (same object as encoder)
+        embedding: nn.Embedding,
         d_model: int = 256,
         num_layers: int = 4,
         num_heads: int = 2,
@@ -97,74 +71,50 @@ class Decoder(nn.Module):
         vocab_size: int = 10_000,
     ):
         super().__init__()
-        self.embedding = embedding
-        self.d_model = d_model
-        self.scale = math.sqrt(d_model)
-
-        self.pos_encoding = SinusoidalPositionalEncoding(d_model, max_len, dropout)
-        self.layers = nn.ModuleList(
+        self.embedding  = embedding
+        self.scale      = math.sqrt(d_model)
+        self.pos_enc    = SinusoidalPositionalEncoding(d_model, max_len, dropout)
+        self.layers     = nn.ModuleList(
             [DecoderLayer(d_model, num_heads, d_ff, dropout) for _ in range(num_layers)]
         )
-        self.norm = nn.LayerNorm(d_model)
-
-        # Output projection: d_model → vocab_size
-        # Weight will be TIED to embedding.weight in HappyBot.__init__
+        self.norm        = nn.LayerNorm(d_model)
         self.output_proj = nn.Linear(d_model, vocab_size, bias=False)
+        # output_proj.weight is TIED to embedding.weight in HappyBot.__init__
 
-    def _make_causal_mask(self, tgt_len: int, device: torch.device) -> torch.Tensor:
+    @staticmethod
+    def _causal_mask(size: int, device: torch.device) -> torch.Tensor:
         """
-        Creates the causal (autoregressive) mask.
-        Returns: (1, 1, T, T) boolean tensor.
-        Lower-triangular = True (position i can attend to 0..i).
-        Upper-triangular = False (blocked — future positions).
+        Lower-triangular bool mask: True = can attend.
+        Shape (1, 1, T, T) — broadcast over batch and heads.
         """
-        mask = torch.tril(torch.ones(tgt_len, tgt_len, device=device, dtype=torch.bool))
-        return mask.unsqueeze(0).unsqueeze(0)  # (1, 1, T, T)
+        return torch.tril(torch.ones(size, size, device=device, dtype=torch.bool)
+                          ).unsqueeze(0).unsqueeze(0)
 
-    def forward(
-        self,
-        tgt: torch.Tensor,         # (B, T_tgt) token ids
-        memory: torch.Tensor,      # (B, T_src, d_model) encoder output
-        src_mask: torch.Tensor,    # (B, 1, 1, T_src) encoder padding mask
-        tgt_pad_mask: torch.Tensor = None,  # (B, 1, 1, T_tgt) decoder padding mask (optional)
-    ) -> dict:
+    def forward(self, tgt, memory, src_mask, tgt_pad_mask=None):
         """
-        Returns:
-          "logits": (B, T_tgt, vocab_size) — raw logits for next-token prediction
-          "self_attn_weights": list of (B, H, T, T) per layer
-          "cross_attn_weights": list of (B, H, T_tgt, T_src) per layer
+        tgt          : (B, T_tgt)            decoder input token ids
+        memory       : (B, T_src, D)         encoder output
+        src_mask     : (B, 1, 1, T_src)      True=real encoder token
+        tgt_pad_mask : (B, 1, 1, T_tgt)      True=real decoder token  (optional)
+
+        Returns dict: logits, self_attn_weights, cross_attn_weights
         """
-        T_tgt = tgt.size(1)
-        device = tgt.device
+        T = tgt.size(1)
+        x = self.pos_enc(self.embedding(tgt) * self.scale)
 
-        # Embedding + scale + positional encoding
-        x = self.embedding(tgt) * self.scale
-        x = self.pos_encoding(x)
+        # Combine causal mask with optional padding mask
+        causal = self._causal_mask(T, tgt.device)          # (1,1,T,T)
+        tgt_mask = causal & tgt_pad_mask if tgt_pad_mask is not None else causal
 
-        # Causal mask: (1, 1, T_tgt, T_tgt)
-        causal_mask = self._make_causal_mask(T_tgt, device)
-
-        # Combine causal mask with decoder padding mask if provided
-        if tgt_pad_mask is not None:
-            # tgt_pad_mask: (B, 1, 1, T_tgt) — True=real token, False=pad
-            # Expand pad mask to (B, 1, T_tgt, T_tgt) and AND with causal
-            tgt_mask = causal_mask & tgt_pad_mask  # broadcasting handles shape
-        else:
-            tgt_mask = causal_mask
-
-        self_attn_all = []
-        cross_attn_all = []
+        sa_weights, ca_weights = [], []
         for layer in self.layers:
-            x, self_w, cross_w = layer(x, memory, tgt_mask, src_mask)
-            self_attn_all.append(self_w)
-            cross_attn_all.append(cross_w)
+            x, sa_w, ca_w = layer(x, memory, tgt_mask, src_mask)
+            sa_weights.append(sa_w)
+            ca_weights.append(ca_w)
 
-        x = self.norm(x)  # Final LayerNorm
-
-        logits = self.output_proj(x)  # (B, T_tgt, vocab_size)
-
+        x = self.norm(x)
         return {
-            "logits": logits,
-            "self_attn_weights": self_attn_all,
-            "cross_attn_weights": cross_attn_all,
+            "logits":             self.output_proj(x),   # (B, T, V)
+            "self_attn_weights":  sa_weights,
+            "cross_attn_weights": ca_weights,
         }

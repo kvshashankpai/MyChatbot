@@ -1,10 +1,18 @@
 """
-encoder.py — Transformer Encoder stack.
-Includes:
-  - Sinusoidal Positional Encoding (pre-computed, no parameters)
-  - EncoderLayer (MHA + FFN + residuals + LayerNorm)
-  - Encoder (embedding + PE + stack + CLS-based NLU heads)
-  - EmotionHead and StrategyHead (2-layer MLPs on the [CLS] token)
+model/encoder.py
+
+Transformer Encoder with:
+  - Sinusoidal positional encoding
+  - PRE-NORM layers  (LayerNorm BEFORE each sublayer, not after)
+  - Embedding scaled by √d_model before PE addition
+  - EmotionHead + StrategyHead on the [CLS] token (position 0)
+
+WHY PRE-NORM:
+    Post-norm (LayerNorm after residual) requires the sublayer outputs to be
+    small before normalization can help.  With random init they are NOT small,
+    so gradients vanish in the first few epochs.  Pre-norm puts a clean signal
+    into every sublayer from the very first step, making training from scratch
+    stable without any tricks.
 """
 
 import math
@@ -13,39 +21,28 @@ import torch.nn as nn
 from model.attention import MultiHeadAttention
 
 
-class SinusoidalPositionalEncoding(nn.Module):
-    """
-    Fixed sinusoidal positional encoding (Vaswani et al., 2017).
-    Registered as a buffer — no gradients, moves with the model to GPU.
-    Extrapolates cleanly to unseen sequence lengths.
-    """
+# ── Positional Encoding ───────────────────────────────────────────────────────
 
+class SinusoidalPositionalEncoding(nn.Module):
     def __init__(self, d_model: int, max_len: int = 512, dropout: float = 0.1):
         super().__init__()
         self.dropout = nn.Dropout(dropout)
 
-        pe = torch.zeros(max_len, d_model)  # (max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)  # (max_len, 1)
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2, dtype=torch.float) * (-math.log(10000.0) / d_model)
-        )
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)  # (1, max_len, d_model)
-        self.register_buffer("pe", pe)
+        pe  = torch.zeros(max_len, d_model)
+        pos = torch.arange(max_len, dtype=torch.float).unsqueeze(1)       # (L,1)
+        div = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float)
+                        * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer("pe", pe.unsqueeze(0))  # (1, L, D)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B, T, d_model) — add positional encoding in-place"""
-        x = x + self.pe[:, : x.size(1), :]
-        return self.dropout(x)
+        return self.dropout(x + self.pe[:, :x.size(1)])
 
+
+# ── Feed-Forward ──────────────────────────────────────────────────────────────
 
 class FeedForward(nn.Module):
-    """
-    Position-wise FFN: Linear(d_model → d_ff) → ReLU → Dropout → Linear(d_ff → d_model).
-    Standard 4× expansion: d_ff = 4 * d_model = 1024.
-    """
-
     def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1):
         super().__init__()
         self.net = nn.Sequential(
@@ -54,176 +51,117 @@ class FeedForward(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(d_ff, d_model),
         )
-        self._init_weights()
+        for m in self.net:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
 
-    def _init_weights(self):
-        for layer in self.net:
-            if isinstance(layer, nn.Linear):
-                nn.init.xavier_uniform_(layer.weight)
-                nn.init.zeros_(layer.bias)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         return self.net(x)
 
 
+# ── Encoder Layer (PRE-NORM) ──────────────────────────────────────────────────
+
 class EncoderLayer(nn.Module):
     """
-    Single encoder layer:
-      x → MHA(x,x,x) → add+norm → FFN → add+norm
-    Pre-norm variant: LayerNorm BEFORE the sublayer (more stable for small
-    from-scratch training). This is the key fix over the naive post-norm.
+    Pre-norm residual block:
+        x = x + Dropout( MHA( LayerNorm(x) ) )
+        x = x + Dropout( FFN( LayerNorm(x) ) )
     """
 
     def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout: float = 0.1):
         super().__init__()
         self.self_attn = MultiHeadAttention(d_model, num_heads, dropout)
-        self.ffn = FeedForward(d_model, d_ff, dropout)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.dropout = nn.Dropout(dropout)
+        self.ffn       = FeedForward(d_model, d_ff, dropout)
+        self.norm1     = nn.LayerNorm(d_model)
+        self.norm2     = nn.LayerNorm(d_model)
+        self.drop      = nn.Dropout(dropout)
 
-    def forward(
-        self,
-        x: torch.Tensor,          # (B, T, d_model)
-        src_mask: torch.Tensor,    # (B, 1, 1, T) — padding mask, True=attend
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Pre-norm self-attention
-        residual = x
-        x_norm = self.norm1(x)
-        attn_out, attn_weights = self.self_attn(x_norm, x_norm, x_norm, mask=src_mask)
-        x = residual + self.dropout(attn_out)
-
-        # Pre-norm FFN
-        residual = x
-        x = residual + self.dropout(self.ffn(self.norm2(x)))
-
-        return x, attn_weights
+    def forward(self, x, src_mask):
+        # 1. Self-attention (pre-norm)
+        x = x + self.drop(self.self_attn(self.norm1(x), self.norm1(x), self.norm1(x), src_mask)[0])
+        # 2. FFN (pre-norm)
+        x = x + self.drop(self.ffn(self.norm2(x)))
+        return x
 
 
-class EmotionHead(nn.Module):
-    """
-    MLP classification head for emotion detection.
-    Operates on the [CLS] token (position 0) from the final encoder layer.
-    """
+# ── NLU Classification Heads ──────────────────────────────────────────────────
 
-    def __init__(self, d_model: int, num_emotion_classes: int, dropout: float = 0.1):
+class ClassificationHead(nn.Module):
+    """Generic 2-layer MLP head operating on the [CLS] vector."""
+
+    def __init__(self, d_model: int, num_classes: int, dropout: float = 0.1):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(d_model // 2, num_emotion_classes),
+            nn.Linear(d_model // 2, num_classes),
         )
-        self._init_weights()
+        for m in self.net:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
 
-    def _init_weights(self):
-        for layer in self.net:
-            if isinstance(layer, nn.Linear):
-                nn.init.xavier_uniform_(layer.weight)
-                nn.init.zeros_(layer.bias)
-
-    def forward(self, cls_vector: torch.Tensor) -> torch.Tensor:
-        """cls_vector: (B, d_model) → logits: (B, num_emotion_classes)"""
-        return self.net(cls_vector)
+    def forward(self, cls_vec):   # (B, D) → (B, num_classes)
+        return self.net(cls_vec)
 
 
-class StrategyHead(nn.Module):
-    """
-    MLP classification head for therapeutic strategy prediction.
-    Operates on the same [CLS] token.
-    8 strategy classes matching ESConv canonical labels.
-    """
-
-    def __init__(self, d_model: int, num_strategy_classes: int = 8, dropout: float = 0.1):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model // 2, num_strategy_classes),
-        )
-        self._init_weights()
-
-    def _init_weights(self):
-        for layer in self.net:
-            if isinstance(layer, nn.Linear):
-                nn.init.xavier_uniform_(layer.weight)
-                nn.init.zeros_(layer.bias)
-
-    def forward(self, cls_vector: torch.Tensor) -> torch.Tensor:
-        """cls_vector: (B, d_model) → logits: (B, num_strategy_classes)"""
-        return self.net(cls_vector)
-
+# ── Full Encoder ──────────────────────────────────────────────────────────────
 
 class Encoder(nn.Module):
     """
-    Full Encoder stack:
-      token_embedding + sinusoidal_PE → N × EncoderLayer → EmotionHead + StrategyHead
-
-    IMPORTANT: embedding is passed in from HappyBot (shared with decoder input embedding).
-    The encoder does NOT own the embedding — it receives it from the top-level module.
-    This enforces weight tying.
+    embedding is passed in (shared with decoder) — do NOT create it here.
+    Embedding is scaled by √d_model BEFORE adding positional encoding.
     """
 
     def __init__(
         self,
-        embedding: nn.Embedding,       # shared embedding from HappyBot
+        embedding: nn.Embedding,
         d_model: int = 256,
         num_layers: int = 4,
         num_heads: int = 2,
         d_ff: int = 1024,
         max_len: int = 512,
         dropout: float = 0.1,
-        num_emotion_classes: int = 32,   # EmpatheticDialogues has 32 emotion labels
-        num_strategy_classes: int = 8,   # ESConv canonical strategies
+        num_emotion_classes: int = 32,
+        num_strategy_classes: int = 8,
     ):
         super().__init__()
-        self.embedding = embedding
-        self.d_model = d_model
-        self.scale = math.sqrt(d_model)
-
-        self.pos_encoding = SinusoidalPositionalEncoding(d_model, max_len, dropout)
-        self.layers = nn.ModuleList(
+        self.embedding  = embedding
+        self.scale      = math.sqrt(d_model)   # ← critical: must multiply before PE
+        self.pos_enc    = SinusoidalPositionalEncoding(d_model, max_len, dropout)
+        self.layers     = nn.ModuleList(
             [EncoderLayer(d_model, num_heads, d_ff, dropout) for _ in range(num_layers)]
         )
-        self.norm = nn.LayerNorm(d_model)  # final pre-norm after all layers
+        self.norm           = nn.LayerNorm(d_model)   # final norm after all layers
+        self.emotion_head   = ClassificationHead(d_model, num_emotion_classes, dropout)
+        self.strategy_head  = ClassificationHead(d_model, num_strategy_classes, dropout)
 
-        self.emotion_head = EmotionHead(d_model, num_emotion_classes, dropout)
-        self.strategy_head = StrategyHead(d_model, num_strategy_classes, dropout)
-
-    def forward(
-        self,
-        src: torch.Tensor,       # (B, T_src)  token ids
-        src_mask: torch.Tensor,  # (B, 1, 1, T_src)  True=attend (not padding)
-    ) -> dict:
+    def forward(self, src, src_mask):
         """
-        Returns a dict:
-          "memory": (B, T_src, d_model) — encoder output passed to cross-attention
-          "emotion_logits": (B, num_emotion_classes)
-          "strategy_logits": (B, num_strategy_classes)
-          "attn_weights": list of (B, H, T, T) per layer (for visualization)
+        src      : (B, T)            token ids
+        src_mask : (B, 1, 1, T)      True = real token, False = pad
+        Returns dict with memory, emotion_logits, strategy_logits, attn_weights.
         """
-        # Embedding + scale + positional encoding
-        x = self.embedding(src) * self.scale    # (B, T, d_model)
-        x = self.pos_encoding(x)
+        x = self.pos_enc(self.embedding(src) * self.scale)  # (B, T, D)
 
-        attn_weights_all = []
+        attn_weights = []
         for layer in self.layers:
-            x, attn_w = layer(x, src_mask)
-            attn_weights_all.append(attn_w)
+            # Forward through layer — we need the attn weights too, so call self_attn directly
+            normed = layer.norm1(x)
+            attn_out, aw = layer.self_attn(normed, normed, normed, src_mask)
+            x = x + layer.drop(attn_out)
+            x = x + layer.drop(layer.ffn(layer.norm2(x)))
+            attn_weights.append(aw)
 
-        x = self.norm(x)  # Final LayerNorm
+        x = self.norm(x)
 
-        # CLS token is always at position 0
-        cls_vector = x[:, 0, :]  # (B, d_model)
-
-        emotion_logits = self.emotion_head(cls_vector)    # (B, num_emotion_classes)
-        strategy_logits = self.strategy_head(cls_vector)  # (B, num_strategy_classes)
-
+        cls = x[:, 0, :]   # [CLS] token is always at position 0
         return {
-            "memory": x,
-            "emotion_logits": emotion_logits,
-            "strategy_logits": strategy_logits,
-            "cls_vector": cls_vector,
-            "attn_weights": attn_weights_all,
+            "memory":           x,
+            "cls_vector":       cls,
+            "emotion_logits":   self.emotion_head(cls),
+            "strategy_logits":  self.strategy_head(cls),
+            "attn_weights":     attn_weights,
         }
